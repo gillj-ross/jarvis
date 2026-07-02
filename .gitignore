@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# personal memory/state — don't commit your own data
+memory/*.db
+memory/*.md
+memory/*.json
+!memory/.gitkeep
+
+# OS/editor
+.DS_Store
+.vscode/
