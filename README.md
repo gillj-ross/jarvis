@@ -7,7 +7,8 @@ eventually voice.
 Full plan and reasoning: see `docs/personal_jarvis_plan.md`.
 
 ## Status
-Phase 1 (in progress): CLI assistant with persistent memory, no voice/integrations yet.
+Environment setup complete: repo on GitHub, Python venv working, API key verified (`src/test_connection.py` passes).
+Next: build the phase 1 CLI assistant (prompt in, memory loaded, Claude called, memory written back).
 
 ## Setup
 1. Python 3.11+, in WSL2 (Ubuntu) on Windows.
