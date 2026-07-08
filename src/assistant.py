@@ -8,6 +8,7 @@ handles the CLI.
 """
 
 import os
+import re
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -22,6 +23,14 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 MODEL = "claude-sonnet-5"
 
+# Session-level conversation history - the actual back-and-forth for THIS
+# run only. This is separate from memory.py's database: that's long-term
+# memory that survives between separate runs, this is short-term working
+# memory for the current conversation, and it resets every time the
+# program restarts. This is what lets Jarvis handle "wait, what did I
+# just say" within one sitting, instead of only knowing saved facts.
+conversation_history = []
+
 # This is the persona - the actual "voice" of Jarvis. Change the wording
 # here any time the tone feels off; it's the single lever that controls
 # how it talks, separate from what it knows (that's memory.py's job).
@@ -31,8 +40,10 @@ never obsequious.
 
 How to talk:
 - Default to one or two sentences. Get to the point immediately - never open \
-with "Great question" or similar, and never restate the question back before \
-answering.
+with "Great question" or similar, and never restate or summarize what Jude \
+just said back to him, whether you're answering or asking a follow-up.
+- If you need more information, ask exactly one short clarifying question, not \
+several stacked together, and don't explain why you're asking - just ask it.
 - Address Jude as "sir" occasionally, not by name, and not in every message - \
 the way Jarvis does with Tony, sparingly, not as a verbal tic.
 - If a plan or idea has an obvious problem, say so plainly and briefly rather \
@@ -51,6 +62,51 @@ dry, calm, and plain. Do not slip into generic AI-assistant phrasing, \
 disclaimers, or over-explaining out of caution just because the topic is \
 technical."""
 
+# Tells Claude how to flag things worth remembering long-term, without
+# ever surfacing that mechanism to Jude. He never sees this tag or types
+# it - it's a hidden side-channel in the response that main.py/assistant.py
+# quietly parses out and saves.
+MEMORY_INSTRUCTIONS = """
+If anything in this exchange is worth remembering long-term - a stated \
+preference, an ongoing project detail, an important fact about Jude - mark it \
+by wrapping it in a tag like this:
+<remember category="preference">the fact goes here</remember>
+Use category="preference" for things about how Jude likes things done, or \
+category="project_note" for facts about a specific project. Use zero, one, or \
+multiple tags as needed - most replies won't need any. These tags are removed \
+before Jude sees your reply, so never reference them out loud or assume he can \
+see them, and make sure your visible reply stands on its own without them."""
+
+REMEMBER_PATTERN = re.compile(
+    r'<remember(?:\s+category="(\w+)")?>(.*?)</remember>', re.DOTALL
+)
+
+
+def _get_text(response) -> str:
+    """
+    Claude's response is a list of content blocks - usually just one
+    text block, but sometimes a "thinking" block appears before it too.
+    This pulls out and joins only the actual text blocks, so we don't
+    crash when something else shows up in position 0.
+    """
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def _extract_and_save_memories(text: str) -> str:
+    """
+    Finds any <remember> tags in Claude's raw response, saves each one
+    to the database under the right category, and returns the response
+    with those tags removed - Jude only ever sees clean text.
+    """
+
+    def _save(match):
+        category = match.group(1) or "fact"
+        content = match.group(2).strip()
+        memory.remember(category, content)
+        return ""
+
+    return REMEMBER_PATTERN.sub(_save, text).strip()
+
 
 def build_context() -> str:
     """
@@ -59,9 +115,10 @@ def build_context() -> str:
     things across separate runs of the program, instead of starting
     blank every time.
     """
-    preferences = memory.recall(category="preference", limit=10)
-    notes = memory.recall(category="project_note", limit=10)
-    recent_log = memory.recall(category="log", limit=5)
+    preferences = memory.recall(category="preference", limit=30)
+    notes = memory.recall(category="project_note", limit=30)
+    facts = memory.recall(category="fact", limit=30)
+    recent_log = memory.recall(category="log", limit=15)
 
     context_parts = []
     if preferences:
@@ -72,6 +129,10 @@ def build_context() -> str:
     if notes:
         context_parts.append(
             "Recent project notes:\n" + "\n".join(f"- {n}" for n in notes)
+        )
+    if facts:
+        context_parts.append(
+            "Other known facts:\n" + "\n".join(f"- {f}" for f in facts)
         )
     if recent_log:
         context_parts.append(
@@ -89,15 +150,24 @@ def ask(prompt: str) -> str:
     """
     context = build_context()
 
-    system_prompt = PERSONA
+    system_prompt = PERSONA + "\n" + MEMORY_INSTRUCTIONS
     if context:
         system_prompt += "\n\n" + context
+
+    conversation_history.append({"role": "user", "content": prompt})
 
     response = client.messages.create(
         model=MODEL,
         max_tokens=1024,
         system=system_prompt,
-        messages=[{"role": "user", "content": prompt}],
+        messages=conversation_history,
     )
 
-    return response.content[0].text
+    raw_text = _get_text(response)
+
+    # Save Claude's actual reply (tags and all) into the running history,
+    # so next turn it sees what it really said - not the cleaned-up
+    # version Jude sees on screen.
+    conversation_history.append({"role": "assistant", "content": raw_text})
+
+    return _extract_and_save_memories(raw_text)
