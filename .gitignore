@@ -5,6 +5,7 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-win/
 venv/
 
 # personal memory/state — don't commit your own data

@@ -59,6 +59,26 @@ def remember(category: str, content: str):
     conn.close()
 
 
+def forget(keyword: str) -> int:
+    """
+    Deletes any memory whose content contains the given keyword/phrase
+    (case-insensitive, partial match) - across every category, since a
+    stale fact can hide in preferences, notes, or the raw log alike.
+
+    Returns how many rows were actually deleted, so the caller can tell
+    whether anything really happened.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "DELETE FROM memory WHERE content LIKE ? COLLATE NOCASE",
+        (f"%{keyword}%",),
+    )
+    conn.commit()
+    deleted = cursor.rowcount
+    conn.close()
+    return deleted
+
+
 def recall(category: str = None, limit: int = 20) -> list[str]:
     """
     Pulls back recent memories, most recent first.

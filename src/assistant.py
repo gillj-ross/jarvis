@@ -76,11 +76,22 @@ Use category="preference" for things about how Jude likes things done, or \
 category="project_note" for facts about a specific project. Use zero, one, or \
 multiple tags as needed - most replies won't need any. These tags are removed \
 before Jude sees your reply, so never reference them out loud or assume he can \
-see them, and make sure your visible reply stands on its own without them."""
+see them, and make sure your visible reply stands on its own without them.
+
+If Jude explicitly asks you to forget something, or tells you a previously \
+remembered fact is no longer true or relevant, mark it for deletion like this:
+<forget>a distinctive word or phrase from the original memory</forget>
+Use enough of the original wording to uniquely match it - this deletes any \
+stored memory containing that phrase, so avoid something too short or generic \
+(like a single common word) that could accidentally delete unrelated memories. \
+Same as the remember tag: this is invisible to Jude and gets stripped from \
+your reply before he sees it."""
 
 REMEMBER_PATTERN = re.compile(
     r'<remember(?:\s+category="(\w+)")?>(.*?)</remember>', re.DOTALL
 )
+
+FORGET_PATTERN = re.compile(r'<forget>(.*?)</forget>', re.DOTALL)
 
 
 def _get_text(response) -> str:
@@ -107,6 +118,22 @@ def _extract_and_save_memories(text: str) -> str:
         return ""
 
     return REMEMBER_PATTERN.sub(_save, text).strip()
+
+
+def _extract_and_forget_memories(text: str) -> str:
+    """
+    Finds any <forget> tags in Claude's raw response, deletes any
+    matching memory from the database, and returns the response with
+    those tags removed - same pattern as the remember side, just in
+    reverse.
+    """
+
+    def _forget(match):
+        keyword = match.group(1).strip()
+        memory.forget(keyword)
+        return ""
+
+    return FORGET_PATTERN.sub(_forget, text).strip()
 
 
 def build_context() -> str:
@@ -184,4 +211,6 @@ def ask(prompt: str) -> str:
     # version Jude sees on screen.
     conversation_history.append({"role": "assistant", "content": raw_text})
 
-    return _extract_and_save_memories(raw_text)
+    cleaned = _extract_and_save_memories(raw_text)
+    cleaned = _extract_and_forget_memories(cleaned)
+    return cleaned
