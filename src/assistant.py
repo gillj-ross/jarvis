@@ -10,6 +10,7 @@ handles the CLI.
 import os
 import re
 
+import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -156,12 +157,25 @@ def ask(prompt: str) -> str:
 
     conversation_history.append({"role": "user", "content": prompt})
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=system_prompt,
-        messages=conversation_history,
-    )
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=conversation_history,
+        )
+    except anthropic.APIConnectionError:
+        conversation_history.pop()
+        return "Couldn't reach Claude's servers just now, sir. Check your connection and try again."
+    except anthropic.RateLimitError:
+        conversation_history.pop()
+        return "Hit a rate limit. Give it a moment and try again."
+    except anthropic.APIStatusError as e:
+        conversation_history.pop()
+        return f"Claude's API returned an error ({e.status_code}). Try again shortly."
+    except Exception as e:
+        conversation_history.pop()
+        return f"Something unexpected went wrong: {e}"
 
     raw_text = _get_text(response)
 
