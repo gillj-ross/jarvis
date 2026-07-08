@@ -25,6 +25,8 @@ from System.Windows.Forms import Screen
 
 import webview
 
+import assistant
+
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 
@@ -182,13 +184,37 @@ widget_html = f"""
     <span>jarvis</span>
   </div>
   <div id="messages"></div>
-  <input id="msg-input" placeholder="message jarvis (not wired up yet)" disabled>
+  <input id="msg-input" placeholder="">
 </div>
 <script>
 function setChatOpen(open) {{
   document.getElementById('badge').style.display = open ? 'none' : 'flex';
   document.getElementById('panel').style.display = open ? 'flex' : 'none';
 }}
+
+function addMessage(sender, text) {{
+  const messages = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg ' + sender;
+  div.textContent = text;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+}}
+
+const msgInput = document.getElementById('msg-input');
+msgInput.addEventListener('keydown', function(e) {{
+  if (e.key === 'Enter' && msgInput.value.trim() !== '') {{
+    const text = msgInput.value.trim();
+    msgInput.value = '';
+    msgInput.disabled = true;
+    addMessage('you', text);
+    window.pywebview.api.send_message(text).then(function(response) {{
+      addMessage('jarvis', response);
+      msgInput.disabled = false;
+      msgInput.focus();
+    }});
+  }}
+}});
 
 // Distinguishes a real click from a drag that just ended - dragging
 // through pywebview's drag-region still fires a trailing click event
@@ -268,6 +294,13 @@ class Api:
         if chat_open:
             rect = get_current_rect()
             last_expanded_pos = (rect.left, rect.top)
+
+    def send_message(self, message):
+        # Same assistant.ask() the CLI (main.py) uses - same memory
+        # database too, since both point at the same memory.py file.
+        # This is the only new line of actual "brain" logic here; the
+        # rest is just wiring it into the widget's chat panel.
+        return assistant.ask(message)
 
 
 window = webview.create_window(
