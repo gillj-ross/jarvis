@@ -43,7 +43,12 @@ VOICE_ID = "oQ3jHNJpnC1H30u4KKgJ"
 VOICE_SETTINGS = {
     "stability": 0.6,
     "similarity_boost": 0.7,
-    "style": 0.15,
+    # Was 0.15 - ElevenLabs' own troubleshooting docs specifically call
+    # out nonzero style as a cause of "inconsistent speed, mispronunciation
+    # and the addition of extra sounds," and recommend 0 if you're seeing
+    # exactly that class of artifact - which the clipped-first-word issue
+    # below is.
+    "style": 0.0,
     "use_speaker_boost": False,
     "speed": 0.95,
 }
@@ -51,7 +56,6 @@ VOICE_SETTINGS = {
 # Matches a sentence-ending punctuation mark followed by whitespace, so
 # we can insert a pause there.
 SENTENCE_END = re.compile(r"([.!?])\s+")
-
 
 def _add_pacing(text: str) -> str:
     """
@@ -63,6 +67,15 @@ def _add_pacing(text: str) -> str:
     adding up to a very noticeable drag on longer, multi-sentence
     replies, since every extra sentence meant another full pause
     stacked on top of the last.
+
+    Used to also try working around ElevenLabs' documented first-word-
+    clipping bug (see their feedback board: "First word cut off") -
+    first with a <break time="Xs"/> tag baked into the request, then
+    with a silent delay on the playback side (widget_app.py). Neither
+    reliably fixed it, so both were dropped rather than kept as dead
+    weight. This looks like it's genuinely upstream in ElevenLabs'
+    generation, not something fixable from this side - worth checking
+    their feedback board occasionally to see if it's been resolved.
     """
     return SENTENCE_END.sub(r"\1\n", text)
 

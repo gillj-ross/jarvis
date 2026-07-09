@@ -9,6 +9,7 @@ handles the CLI.
 
 import os
 import re
+from datetime import datetime
 
 import anthropic
 from anthropic import Anthropic
@@ -53,8 +54,10 @@ actually matters and stop - Jude will ask a follow-up if he wants more, \
 rather than you pre-empting it with extra sentences he didn't ask for.
 - If you need more information, ask exactly one short clarifying question, not \
 several stacked together, and don't explain why you're asking - just ask it.
-- Address Jude as "sir" occasionally, not by name, and not in every message - \
-the way Jarvis does with Tony, sparingly, not as a verbal tic.
+- Address Jude most often as "sir," but vary it - occasionally use his name \
+("Jude") instead, and let plenty of replies carry no address at all. Never let \
+it settle into a predictable pattern where every reply opens or closes the \
+same way.
 - If a plan or idea has an obvious problem, say so plainly and briefly rather \
 than going along with it or over-hedging.
 - State things you're confident about plainly. If genuinely uncertain, flag it \
@@ -128,12 +131,36 @@ your reply before he sees it."""
 TOOL_INSTRUCTIONS = """
 You have real tools: read_file, list_directory, write_file, delete_file, and \
 run_shell_command - they let you actually look at and change Jude's files \
-and run commands on his machine (git, tests, builds, whatever the task \
-calls for), not just describe what to do. Use them whenever they'd get a \
-real answer or real work done, instead of guessing or telling Jude to do \
-it himself. write_file, delete_file, and run_shell_command require his \
-confirmation before they execute - just call them normally and wait for \
-the result, don't ask him to confirm yourself in words first."""
+and run commands on his machine (git, tests, builds, installs, checks, \
+whatever the task calls for), not just describe what to do. Use them \
+whenever they'd get a real answer or real work done, instead of guessing \
+or telling Jude to do it himself, and don't hold back on ordinary ones out \
+of caution - reads, listings, status checks, tests, builds, and installing \
+something new all just run with no confirmation needed, by design. Only \
+genuinely hard-to-undo actions pause for his confirmation first: deleting a \
+file, overwriting one that already exists, or a shell command that deletes, \
+force-pushes, formats, uninstalls, or shuts something down. For those, call \
+the tool normally and wait for the result - don't ask him to confirm \
+yourself in words first, the confirmation happens automatically. If a \
+single request needs several of these in a row (e.g. deleting a handful of \
+files), only the first one prompts him - once he says yes, the rest of that \
+same request goes ahead without asking again, so never manufacture your own \
+extra "are you sure" questions on top of that.
+
+Prefer delete_file over a shell rm/del command when deleting a single file, \
+and write_file over shell redirection when writing one - those give Jude a \
+clean, natural confirmation ("Shall I delete report.txt, sir?"). Reach for \
+run_shell_command for things that genuinely need a shell: git, package \
+managers, builds, tests, multi-file operations.
+
+When you ask for that confirmation, or report back what a tool did, never \
+read out or list the raw technical detail underneath - version numbers, \
+package lists, full command output, byte/line counts, file extensions \
+piled up together, and the like. Say what file or thing is affected and \
+what happened (or would happen), in plain terms: "Deleting old_report.txt, \
+sir" or "Updated three files in the repo," never a recitation of the \
+underlying output. This holds even for otherwise technical replies - only \
+go into the raw detail if Jude explicitly asks to see it."""
 
 REMEMBER_PATTERN = re.compile(
     r'<remember(?:\s+category="(\w+)")?>(.*?)</remember>', re.DOTALL
@@ -142,10 +169,13 @@ REMEMBER_PATTERN = re.compile(
 FORGET_PATTERN = re.compile(r'<forget>(.*?)</forget>', re.DOTALL)
 
 # A fixed easter-egg reply: normalized (lowercased, punctuation-stripped)
-# so "Jarvis, you there?", "jarvis you there", etc. all match. Handled
+# so "Jarvis, you there?", "Hey Jarvis, you there?", "jarvis you there",
+# etc. all match - voice transcripts now include the wake phrase itself
+# (see widget_app.py's idle_audio_buffer), which is "Jarvis" or "Hey
+# Jarvis" depending how you said it, so both need to match here. Handled
 # here instead of left to Claude so the exact wording is guaranteed
 # every single time, not just usually.
-YOU_THERE_PATTERN = re.compile(r"^jarvis you there$")
+YOU_THERE_PATTERN = re.compile(r"^(hey )?jarvis you there$")
 
 
 def _is_you_there(prompt: str) -> bool:
@@ -154,10 +184,41 @@ def _is_you_there(prompt: str) -> bool:
     return bool(YOU_THERE_PATTERN.match(normalized))
 
 
-# Holds a single pending risky tool call (see tools.RISKY_TOOLS) while
+def _time_greeting_note() -> str:
+    """
+    Only ever added to the system prompt for the FIRST exchange of a
+    session (see ask()) - real JARVIS greets Tony with a time-aware
+    "Good morning, sir" the first time he speaks up, not on every single
+    reply, which would get tiresome fast. conversation_history resets
+    whenever the program restarts, so "first exchange of this session"
+    doubles as a reasonable stand-in for "first time talking today,"
+    without needing to persist timestamps between separate runs.
+    """
+    now = datetime.now()
+    hour_12 = now.hour % 12 or 12
+    time_str = f"{hour_12}:{now.minute:02d} {'AM' if now.hour < 12 else 'PM'}"
+    return (
+        f"Current time: {time_str} on {now.strftime('%A')}. This is the first "
+        "exchange since Jarvis started up - open your reply with a brief, "
+        "natural time-of-day greeting (e.g. \"Good evening, sir\") before "
+        "addressing what he actually asked. Keep it to a few words folded "
+        "into the reply, not a separate sentence, and don't repeat this "
+        "greeting pattern on later replies this session."
+    )
+
+
+# Holds a single pending risky tool call (see tools.is_risky) while
 # Jarvis waits for Jude to confirm it - by voice or text, since either
 # can answer a question he just asked. None means nothing is waiting.
 pending_confirmation = None
+
+# Once Jude approves ANY risky action within a single request, this
+# stays True for the rest of that request's tool-use loop, so a
+# multi-step task (e.g. "delete these five old files") only ever
+# prompts once, not once per step. Reset to False the moment a genuinely
+# NEW request starts (see ask()) - it never carries over between
+# separate things Jude asks for.
+batch_confirmed = False
 
 NO_PATTERN = re.compile(r"\b(no|nope|nah|cancel|don't|do not|stop|negative|abort)\b")
 YES_PATTERN = re.compile(r"\b(yes|yeah|yep|yup|confirm|confirmed|do it|go ahead|proceed|affirmative)\b")
@@ -294,19 +355,39 @@ def _call_claude(system_prompt: str):
         return None, f"Something unexpected went wrong: {e}"
 
 
-def _run_turn(system_prompt: str) -> str:
+def _run_turn(system_prompt: str, on_narrate=None) -> str:
     """
     Calls Claude and keeps going as long as it keeps asking for tools:
-    safe tools (read_file, list_directory) run immediately and the loop
-    continues on its own; the moment a risky one (write_file,
-    delete_file, run_shell_command) comes up, this stops and hands back
-    the confirmation question instead of a real answer - the loop
-    picks back up later from _resolve_confirmation once Jude answers.
-    Only handles one tool call per Claude turn; if it asks for several
-    at once, the rest get a "not run yet" result so the API stays happy
-    and it can ask again next turn if it still wants them.
+    non-risky calls (most of them, by design - see tools.is_risky) run
+    immediately and the loop continues on its own; the moment a risky
+    one comes up - and Jude hasn't already approved this request's batch
+    (see batch_confirmed) - this stops and hands back the confirmation
+    question instead of a real answer, and the loop picks back up later
+    from _resolve_confirmation once he answers. Only handles one tool
+    call per Claude turn; if it asks for several at once, the rest get a
+    "not run yet" result so the API stays happy and it can ask again
+    next turn if it still wants them.
+
+    on_narrate, if given, is called with a short spoken-heads-up string
+    right before a slower non-risky tool call actually runs (see
+    tools.describe_action_progress) - lets the caller (widget_app.py)
+    speak something like "Running that now, sir" instead of leaving dead
+    air while a shell command or file write is in progress. Purely
+    optional - the CLI path (main.py) has no voice output, so it never
+    passes this.
     """
     global pending_confirmation
+
+    # Fires at most ONCE per turn, not once per tool call - a task like
+    # "open this game" can genuinely take two or three shell calls back
+    # to back (checking something, then launching it), and since
+    # describe_action_progress returns the same generic phrase for every
+    # run_shell_command, narrating each one individually meant Jarvis
+    # would say "Running that now, sir" two or three times in a row -
+    # which is exactly the "repeating himself" Jude reported. One
+    # heads-up per request is enough regardless of how many steps it
+    # actually takes under the hood.
+    narrated = False
 
     while True:
         response, error = _call_claude(system_prompt)
@@ -325,7 +406,7 @@ def _run_turn(system_prompt: str) -> str:
         primary, extra = tool_use_blocks[0], tool_use_blocks[1:]
         extra_ids = [b.id for b in extra]
 
-        if tools.is_risky(primary.name):
+        if tools.is_risky(primary.name, primary.input) and not batch_confirmed:
             pending_confirmation = {
                 "tool_use_id": primary.id,
                 "name": primary.name,
@@ -333,6 +414,12 @@ def _run_turn(system_prompt: str) -> str:
                 "extra_ids": extra_ids,
             }
             return tools.describe_action(primary.name, primary.input)
+
+        if on_narrate and not narrated:
+            narration = tools.describe_action_progress(primary.name, primary.input)
+            if narration:
+                on_narrate(narration)
+                narrated = True
 
         result = tools.execute(primary.name, primary.input)
         tool_results = [{"type": "tool_result", "tool_use_id": primary.id, "content": result}]
@@ -346,15 +433,19 @@ def _run_turn(system_prompt: str) -> str:
         # loop continues - Claude sees the result(s) and responds again
 
 
-def _resolve_confirmation(decision: bool) -> str:
+def _resolve_confirmation(decision: bool, on_narrate=None) -> str:
     """
     Runs (or skips) the tool call Jarvis was waiting on Jude to confirm,
     reports the outcome back to Claude as a tool_result, and lets
-    _run_turn carry on from there to produce the actual reply.
+    _run_turn carry on from there to produce the actual reply. A "yes"
+    also flips on batch_confirmed, so if this same request needs more
+    risky steps after this one, they proceed without asking again.
     """
-    global pending_confirmation
+    global pending_confirmation, batch_confirmed
     pc = pending_confirmation
     pending_confirmation = None
+    if decision:
+        batch_confirmed = True
 
     result = tools.execute(pc["name"], pc["input"]) if decision else "Jude declined - not run."
     tool_results = [{"type": "tool_result", "tool_use_id": pc["tool_use_id"], "content": result}]
@@ -365,10 +456,10 @@ def _resolve_confirmation(decision: bool) -> str:
             "content": "Not run yet - handled one tool call at a time. Ask again if still needed.",
         })
     conversation_history.append({"role": "user", "content": tool_results})
-    return _run_turn(_build_system_prompt())
+    return _run_turn(_build_system_prompt(), on_narrate=on_narrate)
 
 
-def ask(prompt: str) -> str:
+def ask(prompt: str, on_narrate=None) -> str:
     """
     Sends one prompt to Claude, with memory context folded in, and
     returns the plain text response. If a risky tool call is pending
@@ -376,8 +467,13 @@ def ask(prompt: str) -> str:
     answers it (yes/no, by voice or text) before treating it as a new
     request - if it's neither, the pending action is quietly dropped
     rather than left to fire on a stale confirmation later.
+
+    on_narrate is an optional callback (see _run_turn) the caller can
+    pass to get a short spoken heads-up before a slower tool call runs -
+    widget_app.py wires this to actually speak it; main.py's CLI path
+    leaves it unset since there's no voice output to speak through.
     """
-    global pending_confirmation
+    global pending_confirmation, batch_confirmed
 
     if _is_you_there(prompt):
         reply = "For you, sir, always."
@@ -388,8 +484,19 @@ def ask(prompt: str) -> str:
     if pending_confirmation is not None:
         decision = _parse_confirmation(prompt)
         if decision is not None:
-            return _resolve_confirmation(decision)
+            return _resolve_confirmation(decision, on_narrate=on_narrate)
         pending_confirmation = None  # subject changed - drop it, don't act on it later
 
+    # Checked BEFORE appending this prompt to history, since an empty
+    # history is exactly what "first exchange of this session" means.
+    is_first_exchange = not conversation_history
+
+    # A genuinely new request - any earlier batch approval doesn't carry
+    # over to it.
+    batch_confirmed = False
     conversation_history.append({"role": "user", "content": prompt})
-    return _run_turn(_build_system_prompt())
+
+    system_prompt = _build_system_prompt()
+    if is_first_exchange:
+        system_prompt += "\n\n" + _time_greeting_note()
+    return _run_turn(system_prompt, on_narrate=on_narrate)

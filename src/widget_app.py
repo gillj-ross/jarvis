@@ -21,6 +21,7 @@ import json
 import threading
 import traceback
 import wave
+from collections import deque
 from ctypes import wintypes
 
 import clr
@@ -39,6 +40,10 @@ import tts
 
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
 
 # Mono, 16kHz is plenty for speech and keeps recordings small - matches
 # what ElevenLabs' Scribe model expects to transcribe well.
@@ -70,6 +75,34 @@ def _on_audio_block(indata, frames, time_info, status):
 WAKE_WORD_NAME = "hey_jarvis"
 WAKE_WORD_THRESHOLD = 0.35
 WAKE_CHUNK = 1280  # 80ms at 16kHz - openWakeWord's native frame size
+
+# Said any time, these open the chat panel by voice - now that talking
+# to him no longer auto-opens it (Jude wants to just speak to the idle
+# widget most of the time), this is the deliberate "actually, let me see
+# it" escape hatch, alongside the existing click-to-open. Substring
+# match, same style as STAND_DOWN_PHRASES below.
+CHAT_OPEN_PHRASES = [
+    "pull up the chat",
+    "pull up chat",
+    "open the chat",
+    "open chat",
+    "show the chat",
+    "show chat",
+    "bring up the chat",
+    "bring up chat",
+    "show me the chat",
+    "let me see the chat",
+    "open the panel",
+    "pull up the panel",
+    "bring up the panel",
+    "open the window",
+]
+
+
+def _is_chat_open_request(transcript: str) -> bool:
+    normalized = transcript.lower()
+    return any(phrase in normalized for phrase in CHAT_OPEN_PHRASES)
+
 
 # Said mid-conversation, any of these tell Jarvis to stop listening and
 # wait for the wake word again, silently - no spoken reply, matching
@@ -172,6 +205,7 @@ CONVERSATION_END_PHRASES = [
     "appreciate it",
     "appreciate the help",
     "thanks, buddy",
+    "thanks",
 ]
 
 
@@ -193,12 +227,24 @@ MAX_COMMAND_SECONDS = 15  # hard cap regardless of silence detection
 # word again) for this long - if you keep talking within this window,
 # it counts as a follow-up and the conversation continues; if you stay
 # quiet for the whole window, he goes back to requiring "Jarvis" again.
-FOLLOW_UP_SECONDS = 2.2
+# Raised from 2.2 to 3.2 - a full second more breathing room to start
+# your next thing before he gives up and goes back to idle.
+FOLLOW_UP_SECONDS = 3.2
 
 SILENCE_CHUNKS_NEEDED = int(SILENCE_SECONDS * MIC_SAMPLE_RATE / WAKE_CHUNK)
 MIN_COMMAND_CHUNKS = int(MIN_COMMAND_SECONDS * MIC_SAMPLE_RATE / WAKE_CHUNK)
 MAX_COMMAND_CHUNKS = int(MAX_COMMAND_SECONDS * MIC_SAMPLE_RATE / WAKE_CHUNK)
 FOLLOW_UP_CHUNKS = int(FOLLOW_UP_SECONDS * MIC_SAMPLE_RATE / WAKE_CHUNK)
+
+# openWakeWord only raises the alarm once it's already heard enough of
+# "Hey Jarvis" to be confident - by the time _wake_word_callback sees a
+# score above WAKE_WORD_THRESHOLD, the actual phrase already happened
+# some moments earlier. Continuously keeping the last couple seconds of
+# audio around while idle, and handing that whole buffer to the capture
+# as soon as the wake word fires, is what lets the wake phrase itself
+# end up in the transcript instead of only what's said after it.
+IDLE_BUFFER_SECONDS = 2.0
+IDLE_BUFFER_CHUNKS = int(IDLE_BUFFER_SECONDS * MIC_SAMPLE_RATE / WAKE_CHUNK)
 
 
 def _calibrate_silence_threshold():
@@ -217,13 +263,14 @@ def _calibrate_silence_threshold():
         )
         sd.wait()
         noise_floor = float(np.sqrt(np.mean(sample.astype(np.float32) ** 2)))
-        # Multiplier raised from 2.5x to 3.5x, and the hard floor from 150
-        # to 250 - a click or key clack easily clears a threshold that's
-        # only just above the room's ambient hum, so pushing the bar
-        # higher means it takes something closer to actual speaking
-        # volume to register as "loud" at all, before the consecutive-
-        # frame debounce below even comes into play.
-        threshold = max(noise_floor * 3.5, 250.0)
+        # Went 2.5x/150 -> 3.5x/250 to fight click false-triggers, but
+        # that pushed the bar high enough that normal speaking volume -
+        # especially short words - often didn't clear it either, so
+        # you'd end up half-shouting for him to hear you. Settling in
+        # the middle: still meaningfully above the old click-prone
+        # baseline, but not demanding raised-voice levels for it to
+        # register as "loud" at all.
+        threshold = max(noise_floor * 2.8, 190.0)
         print(f"Ambient noise floor: {noise_floor:.0f} -> silence threshold: {threshold:.0f}")
         return threshold
     except Exception as e:
@@ -238,12 +285,43 @@ wake_model = WakeWordModel(wakeword_models=[WAKE_WORD_NAME], inference_framework
 print("Calibrating silence detection to your room...")
 SILENCE_RMS_THRESHOLD = _calibrate_silence_threshold()
 
+# Barge-in: lets you talk over Jarvis mid-reply instead of having to wait
+# him out, the way Tony does with the real JARVIS. Kept well above
+# SILENCE_RMS_THRESHOLD so ambient noise or Jarvis's own voice bleeding
+# back in through the mic (a real risk without a headset) doesn't
+# trigger nonstop self-interruption - amplitude alone does most of the
+# work filtering that out. BARGE_IN_FRAMES_THRESHOLD used to require a
+# much longer sustained run (~800ms) on top of that, but that made short,
+# urgent interruptions like "Mute" - exactly the case that matters most,
+# since it's how Jude actually stops him mid-sentence - fail to register
+# at all: a single quick word often doesn't sustain that long. Lowered to
+# ~400ms, enough to reject a single-frame click or pop but short enough
+# that a deliberately spoken one-word interruption reliably lands. If
+# speaker bleed still causes false triggers in practice, a headset
+# sidesteps the root cause entirely - worth trying before tuning further.
+BARGE_IN_RMS_THRESHOLD = max(SILENCE_RMS_THRESHOLD * 1.8, 350.0)
+BARGE_IN_FRAMES_THRESHOLD = 5
+
+# Rolling buffer of recent audio while state == "speaking" - mirrors
+# idle_audio_buffer's role for the wake word. Without this, _barge_in()
+# only had the ONE chunk that happened to cross the threshold to work
+# with, which is somewhere in the MIDDLE of whatever you said - for a
+# short word like "Mute," that meant the captured audio often started
+# mid-word or later, so it transcribed as noise or a fragment instead of
+# a word STAND_DOWN_PHRASES could actually match. Buffering the last
+# couple seconds continuously and handing all of it over on trigger
+# means the whole word is there for transcription, not just its tail.
+BARGE_IN_BUFFER_SECONDS = 1.5
+BARGE_IN_BUFFER_CHUNKS = int(BARGE_IN_BUFFER_SECONDS * MIC_SAMPLE_RATE / WAKE_CHUNK)
+
 # The whole listening cycle as one explicit state, rather than a couple
 # of overlapping booleans - easier to reason about now that there are
-# four distinct phases:
+# five distinct phases:
 #   idle       - only listening for the wake word itself
 #   capturing  - actively recording your command, watching for silence
-#   processing - transcribing/thinking/speaking - mic fully ignored
+#   processing - transcribing/thinking - mic fully ignored
+#   speaking   - reply audio is actively playing - mic listens ONLY for
+#                a sustained barge-in (see BARGE_IN_* above), nothing else
 #   follow_up  - reply just finished; listening for you to keep talking
 #                without needing to say "Jarvis" again
 wake_lock = threading.Lock()
@@ -252,22 +330,39 @@ wake_command_frames = []
 wake_silence_run = 0  # consecutive quiet chunks seen since capture started
 wake_follow_up_count = 0  # chunks elapsed since entering the follow_up window
 wake_loud_run = 0  # consecutive loud chunks seen right now
+wake_barge_run = 0  # consecutive loud chunks seen right now, while state == "speaking"
 wake_after_playback = "follow_up"  # what to do once the current reply finishes playing
 wake_stream = None
 
+# Rolling window of recent audio while idle - see IDLE_BUFFER_SECONDS
+# above. Only ever touched from the wake-word callback thread and reset
+# in _enter_idle(), so it doesn't need wake_lock the way wake_state does.
+idle_audio_buffer = deque(maxlen=IDLE_BUFFER_CHUNKS)
+
+# Same idea, for state == "speaking" - see BARGE_IN_BUFFER_SECONDS above.
+barge_in_audio_buffer = deque(maxlen=BARGE_IN_BUFFER_CHUNKS)
+
 # A mouse click, keyboard clack, or similar brief pop is loud enough to
 # cross SILENCE_RMS_THRESHOLD for a single 80ms frame, but it isn't
-# sustained the way actual speech is. Requiring this many CONSECUTIVE
-# loud frames before counting something as "real speech" filters those
-# out - without this, a single click was being treated as "you started
-# talking again" during follow_up (restarting listening even though
-# you'd gone quiet), and was also resetting the silence timer during
-# capturing, so he'd never detect you'd finished talking. Raised from 2
-# to 4, then to 6, after clicks/ambient noise were still occasionally
-# tripping a false start - 6 frames (~480ms) still catches real speech
-# almost immediately, but a click or a burst of typing has to sustain
-# for nearly half a second to fake it now, which real keystrokes and
-# clicks essentially never do.
+# sustained the way actual speech is. These two thresholds both filter
+# that out, but serve different purposes and were splitting them apart
+# fixes a real bug: a single one-syllable word ("yes," "stop," "no") -
+# exactly what the new confirmation flow depends on - often doesn't
+# sustain a full 480ms of loudness, so with one shared 6-frame threshold
+# it was never recognized as speech starting during the follow_up
+# window at all, and got silently dropped rather than acted on.
+#
+# ONSET_FRAMES_THRESHOLD gates "did you just start talking" (used in
+# follow_up, where missing it means losing the entire reply) - kept
+# short so brief words register, at the cost of being a little more
+# forgiving of noise.
+#
+# LOUD_FRAMES_THRESHOLD gates resetting the silence timer during an
+# active capture - staying stricter here is safe, since a click mid-
+# recording doesn't erase anything (everything still gets recorded
+# regardless), it only affects how quickly he decides you've stopped
+# talking, so there's no real downside to keeping this one cautious.
+ONSET_FRAMES_THRESHOLD = 2
 LOUD_FRAMES_THRESHOLD = 6
 
 
@@ -275,30 +370,39 @@ def _rms(chunk):
     return float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
 
 
-def _start_capturing(initial_chunk=None):
+def _start_capturing(initial_chunks=None):
     # Common entry point for beginning to record a command, whether
-    # triggered by the wake word (from idle) or by you simply talking
-    # again during the follow_up window (no wake word needed there).
-    global wake_state, wake_command_frames, wake_silence_run, wake_loud_run
+    # triggered by the wake word (from idle - initial_chunks is the
+    # rolling idle_audio_buffer, so the wake phrase itself is included)
+    # or by you simply talking again during the follow_up window (no
+    # wake word needed there - initial_chunks is just that one chunk).
+    global wake_state, wake_command_frames, wake_silence_run, wake_loud_run, wake_barge_run
     with wake_lock:
         wake_state = "capturing"
-        wake_command_frames = [initial_chunk] if initial_chunk is not None else []
+        wake_command_frames = list(initial_chunks) if initial_chunks else []
     wake_silence_run = 0
     wake_loud_run = 0
-    _open_chat_panel()
-    window.evaluate_js("document.getElementById('mic-btn').classList.add('recording')")
+    wake_barge_run = 0
+    # No longer opens the chat panel here - Jude wants to just speak to
+    # the idle widget without the panel popping up every time. The idle
+    # badge itself now shows the "listening" glow instead (see
+    # setListening() in the JS below); the panel only opens by an
+    # explicit click or a CHAT_OPEN_PHRASES voice request.
+    window.evaluate_js("setListening(true)")
 
 
 def _enter_idle():
     # Back to square one: only "Jarvis"/"Hey Jarvis" wakes him up again.
-    global wake_state, wake_command_frames, wake_silence_run, wake_follow_up_count, wake_loud_run
+    global wake_state, wake_command_frames, wake_silence_run, wake_follow_up_count, wake_loud_run, wake_barge_run
     with wake_lock:
         wake_state = "idle"
         wake_command_frames = []
     wake_silence_run = 0
     wake_follow_up_count = 0
     wake_loud_run = 0
-    window.evaluate_js("document.getElementById('mic-btn').classList.remove('recording')")
+    wake_barge_run = 0
+    idle_audio_buffer.clear()
+    window.evaluate_js("setListening(false)")
 
 
 def _enter_follow_up():
@@ -307,12 +411,32 @@ def _enter_follow_up():
     # talking without repeating the wake word - if you do, _start_
     # capturing() takes over immediately; if not, _wake_word_callback
     # times it out back to _enter_idle().
-    global wake_state, wake_follow_up_count, wake_loud_run
+    global wake_state, wake_follow_up_count, wake_loud_run, wake_barge_run
     with wake_lock:
         wake_state = "follow_up"
     wake_follow_up_count = 0
     wake_loud_run = 0
-    window.evaluate_js("document.getElementById('mic-btn').classList.add('recording')")
+    wake_barge_run = 0
+    window.evaluate_js("setListening(true)")
+
+
+def _barge_in():
+    # Called from _wake_word_callback the instant sustained loud speech
+    # is heard while wake_state == "speaking" - i.e. you're talking over
+    # him. Hands over the WHOLE barge_in_audio_buffer, not just the one
+    # chunk that crossed the threshold - that chunk is somewhere in the
+    # middle of what you said, so using only it would cut off the start
+    # of the word (see BARGE_IN_BUFFER_SECONDS above). Moves straight
+    # into capturing your new command (same as follow_up's mid-
+    # conversation restart) BEFORE telling the page to actually stop the
+    # audio, so that by the time playback's onended fires (see
+    # stopPlayback() in the JS below), Api.playback_finished() sees a
+    # state that's no longer "speaking" and skips its normal follow_up/
+    # idle handling instead of clobbering this.
+    global wake_barge_run
+    wake_barge_run = 0
+    _start_capturing(initial_chunks=list(barge_in_audio_buffer))
+    window.evaluate_js("stopPlayback()")
 
 
 def _wake_word_callback(indata, frames, time_info, status):
@@ -333,7 +457,7 @@ def _wake_word_callback(indata, frames, time_info, status):
     # permanently until the app was relaunched. Wrapping everything
     # below means a single hiccup gets logged and skipped instead of
     # ending wake-word detection for the rest of the session.
-    global wake_state, wake_command_frames, wake_silence_run, wake_follow_up_count, wake_loud_run
+    global wake_state, wake_command_frames, wake_silence_run, wake_follow_up_count, wake_loud_run, wake_barge_run
 
     try:
         with wake_lock:
@@ -342,30 +466,53 @@ def _wake_word_callback(indata, frames, time_info, status):
         chunk = indata[:, 0].copy()
 
         if state == "idle":
+            idle_audio_buffer.append(chunk)
             prediction = wake_model.predict(chunk)
             if prediction.get(WAKE_WORD_NAME, 0.0) > WAKE_WORD_THRESHOLD:
-                _start_capturing()
+                # Hand over everything buffered so far - this is what
+                # gets the wake phrase itself into the transcript,
+                # instead of just what's said after it.
+                _start_capturing(initial_chunks=list(idle_audio_buffer))
             return
 
         if state == "processing":
-            # Mic is fully ignored while Jarvis is transcribing,
-            # thinking, or speaking - he can't hear (and react to) his
-            # own voice, and can't be interrupted mid-response.
+            # Mic is fully ignored while Jarvis is transcribing or
+            # thinking - nothing to interrupt yet, there's no reply
+            # playing.
             return
 
-        # Shared "is this actually speech, or just a click/pop" check for
-        # follow_up and capturing below - see LOUD_FRAMES_THRESHOLD.
+        if state == "speaking":
+            # He's actively talking - the ONLY thing being listened for
+            # here is a deliberate, sustained talk-over (see BARGE_IN_*
+            # above); nothing else about this chunk matters while in
+            # this state. Keeps buffering regardless of whether THIS
+            # chunk crosses the threshold, so whenever it does trigger,
+            # the buffer already has the start of the word in it - see
+            # BARGE_IN_BUFFER_SECONDS.
+            barge_in_audio_buffer.append(chunk)
+            if _rms(chunk) >= BARGE_IN_RMS_THRESHOLD:
+                wake_barge_run += 1
+            else:
+                wake_barge_run = 0
+            if wake_barge_run >= BARGE_IN_FRAMES_THRESHOLD:
+                _barge_in()
+            return
+
+        # Shared loudness tracking for follow_up and capturing below -
+        # see ONSET_FRAMES_THRESHOLD/LOUD_FRAMES_THRESHOLD for why these
+        # use two different debounce lengths off the same counter.
         if _rms(chunk) >= SILENCE_RMS_THRESHOLD:
             wake_loud_run += 1
         else:
             wake_loud_run = 0
+        is_speech_onset = wake_loud_run >= ONSET_FRAMES_THRESHOLD
         is_real_speech = wake_loud_run >= LOUD_FRAMES_THRESHOLD
 
         if state == "follow_up":
             wake_follow_up_count += 1
-            if is_real_speech:
+            if is_speech_onset:
                 # You started talking again - no wake word needed.
-                _start_capturing(initial_chunk=chunk)
+                _start_capturing(initial_chunks=[chunk])
             elif wake_follow_up_count >= FOLLOW_UP_CHUNKS:
                 _enter_idle()
             return
@@ -404,7 +551,7 @@ def _speak_reply(reply_text, end_check_text=""):
     this sounds like the end of the conversation. Returns True if
     handed off to playback, False if speech synthesis failed.
     """
-    global wake_after_playback
+    global wake_after_playback, wake_state, wake_barge_run
 
     audio_b64 = tts.speak(reply_text)
     window.evaluate_js(f"addMessage('jarvis', {json.dumps(reply_text)})")
@@ -415,8 +562,45 @@ def _speak_reply(reply_text, end_check_text=""):
         wake_after_playback = "idle"
     else:
         wake_after_playback = "follow_up"
+    # Moves from "processing" to "speaking" right as playback starts, so
+    # _wake_word_callback starts listening for a barge-in (see BARGE_IN_*
+    # above) instead of staying fully deaf for the whole reply.
+    with wake_lock:
+        wake_state = "speaking"
+    wake_barge_run = 0
+    barge_in_audio_buffer.clear()
     window.evaluate_js(f"playAudioBase64({json.dumps(audio_b64)})")
     return True
+
+
+# Signaled by Api.narration_finished() the moment a narration line (see
+# _narrate below) actually finishes playing - lets _narrate() block the
+# calling thread until Jude's actually heard the heads-up before the
+# tool call it's announcing goes ahead, rather than talking over itself.
+narration_done = threading.Event()
+
+
+def _narrate(text):
+    """
+    Speaks a short "doing this now" line and waits for it to actually
+    finish playing before returning - passed into assistant.ask() as
+    on_narrate, called just before a slower, non-risky tool call (a
+    shell command, writing a file) so there's something to listen to
+    instead of dead air while it runs. Deliberately routed through a
+    SEPARATE pywebview callback (narration_finished, not
+    playback_finished) so it doesn't trip the normal reply-finished
+    logic (opening follow_up, going idle, etc.) - a narration line isn't
+    the actual reply, just a heads-up before more work happens.
+    """
+    audio_b64 = tts.speak(text)
+    window.evaluate_js(f"addMessage('jarvis', {json.dumps(text)})")
+    if not audio_b64:
+        return
+    narration_done.clear()
+    window.evaluate_js(f"playAudioBase64({json.dumps(audio_b64)}, true)")
+    # Timeout is just a safety net in case the JS callback never fires
+    # for some reason - shouldn't ever actually hit it in practice.
+    narration_done.wait(timeout=10)
 
 
 def _process_wake_command(frames_list):
@@ -428,7 +612,7 @@ def _process_wake_command(frames_list):
     # there's a short window to keep talking without repeating the wake
     # word. Every other exit (no audio, empty transcript, or an error)
     # goes straight back to idle instead.
-    window.evaluate_js("document.getElementById('mic-btn').classList.remove('recording')")
+    window.evaluate_js("setListening(false)")
 
     handed_off = False  # set True only once handed off to actual playback
     try:
@@ -450,13 +634,21 @@ def _process_wake_command(frames_list):
 
         window.evaluate_js(f"addMessage('you', {json.dumps(transcript)})")
 
+        if _is_chat_open_request(transcript):
+            # Deliberate "let me see it" request - open the panel and
+            # give a short spoken acknowledgment, but skip sending this
+            # through assistant.ask() entirely, same as stand-down below.
+            _open_chat_panel()
+            handed_off = _speak_reply("There you go, sir.", end_check_text=transcript)
+            return
+
         if _is_stand_down(transcript):
             # No reply is generated or spoken - handed_off stays False,
             # so the finally block below sends this straight back to
             # idle instead of into the follow_up window.
             return
 
-        reply = assistant.ask(transcript)
+        reply = assistant.ask(transcript, on_narrate=_narrate)
         handed_off = _speak_reply(reply, end_check_text=transcript)
     except Exception:
         print("Error handling wake-word command (recovered):")
@@ -465,17 +657,13 @@ def _process_wake_command(frames_list):
         if not handed_off:
             _enter_idle()
 
-MARGIN_RIGHT = 200  # horizontal gap from the right edge - the icon's position
-MARGIN_BOTTOM = 100  # vertical gap from the bottom edge - the icon's position
+MARGIN_RIGHT = 200  # horizontal gap from the right edge - only used for the very first launch position
+MARGIN_BOTTOM = 100  # vertical gap from the bottom edge - only used for the very first launch position
 
-# Where the chat panel opens the very FIRST time (before it's ever been
-# dragged) - independent of the icon's position above, so you can tune
-# this without affecting where the idle icon sits.
-CHAT_MARGIN_RIGHT = 20
-CHAT_MARGIN_BOTTOM = 20
-
-IDLE_WIDTH = 70
-IDLE_HEIGHT = 70
+# Shrunk from 70x70 - a smaller idle footprint that's less likely to
+# sit over anything you're actually working in.
+IDLE_WIDTH = 44
+IDLE_HEIGHT = 44
 EXPANDED_WIDTH = 378  # 280 * 1.35
 EXPANDED_HEIGHT = 513  # 380 * 1.35
 
@@ -502,6 +690,22 @@ def set_bounds(x, y, width, height):
     hwnd = ctypes.windll.user32.FindWindowW(None, "Jarvis")
     ctypes.windll.user32.SetWindowPos(
         hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE
+    )
+
+
+def _set_topmost(topmost: bool):
+    """
+    Toggles always-on-top at runtime, separate from position/size.
+    Staying topmost permanently was exactly what made the idle icon
+    bother Jude while working in other apps - now it's only forced above
+    everything else while the chat panel is actually open (so it can't
+    get buried mid-conversation), and drops back to normal z-order the
+    moment it closes.
+    """
+    hwnd = ctypes.windll.user32.FindWindowW(None, "Jarvis")
+    insert_after = HWND_TOPMOST if topmost else HWND_NOTOPMOST
+    ctypes.windll.user32.SetWindowPos(
+        hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
     )
 
 
@@ -565,7 +769,7 @@ widget_html = f"""
     justify-content: center;
     cursor: pointer;
   }}
-  #badge .orb-svg {{ width: 52px; height: 52px; }}
+  #badge .orb-svg {{ width: 32px; height: 32px; }}
   #panel {{
     display: none;
     flex-direction: column;
@@ -626,10 +830,18 @@ widget_html = f"""
     50% {{ filter: drop-shadow(0 0 12px rgba(55,138,221,0.9)); }}
   }}
   .orb-svg {{ animation: atomGlow 2.6s ease-in-out infinite; }}
+  /* Now that the panel usually stays hidden (see setListening() below),
+     the idle badge itself needs to show when he's actively listening -
+     a faster pulse and a warmer glow, distinct from the resting blue. */
+  @keyframes atomGlowActive {{
+    0%, 100% {{ filter: drop-shadow(0 0 8px rgba(165,50,50,0.8)); }}
+    50% {{ filter: drop-shadow(0 0 16px rgba(220,90,90,1)); }}
+  }}
+  #badge.recording .orb-svg {{ animation: atomGlowActive 1s ease-in-out infinite; }}
 </style>
 </head>
 <body>
-<div id="badge">
+<div id="badge" class="pywebview-drag-region">
   {ORB_SVG}
 </div>
 <div id="panel">
@@ -649,6 +861,15 @@ function setChatOpen(open) {{
   document.getElementById('panel').style.display = open ? 'flex' : 'none';
 }}
 
+// Toggles the "actively listening" indicator on BOTH the idle badge and
+// the mic button - only one of the two is ever visible at a time, but
+// this way whichever one you're looking at shows the right state
+// without the callers needing to know or care which is currently shown.
+function setListening(active) {{
+  document.getElementById('badge').classList.toggle('recording', active);
+  document.getElementById('mic-btn').classList.toggle('recording', active);
+}}
+
 function addMessage(sender, text) {{
   const messages = document.getElementById('messages');
   const div = document.createElement('div');
@@ -658,22 +879,81 @@ function addMessage(sender, text) {{
   messages.scrollTop = messages.scrollHeight;
 }}
 
-function playAudioBase64(b64) {{
+// One AudioContext, created once and reused for every reply for the
+// life of the widget, rather than a fresh <audio> element each time.
+// Waiting for canplaythrough on a brand-new <audio> element still
+// clipped the first syllable on EVERY reply, not just a cold start -
+// each new element has to stand up its own connection to the output
+// device from scratch, and that handshake was eating real audio before
+// playback actually began. Reusing one context keeps that connection
+// warm across the whole session, and decodeAudioData() only resolves
+// once the audio is fully decoded into raw samples - a stronger
+// guarantee than canplaythrough - so scheduling playback after that is
+// as tight as this can get.
+let audioCtx = null;
+
+// Playback volume multiplier - 1.0 is unchanged, 1.3 is 30% louder.
+// Applied via a GainNode rather than touching the TTS audio itself, so
+// it's a pure playback-side boost with no re-encoding involved.
+const VOLUME_GAIN = 1.3;
+
+// The currently-playing source node, if any - tracked so a barge-in
+// (see _barge_in in the Python) can force-stop playback immediately via
+// stopPlayback() below, rather than having to wait for it to finish on
+// its own.
+let currentSource = null;
+
+function stopPlayback() {{
+  if (currentSource) {{
+    try {{ currentSource.stop(); }} catch (e) {{}}
+    currentSource = null;
+  }}
+}}
+
+// isNarration distinguishes a short "doing this now" heads-up (see
+// _narrate in the Python) from an actual reply: both play through the
+// exact same pipeline, but a narration line reports back through a
+// separate callback (narration_finished) so it doesn't trigger the
+// normal reply-finished handling (opening follow_up, going idle, etc.)
+// meant for actual replies.
+function playAudioBase64(b64, isNarration) {{
+  const notify = function() {{
+    if (isNarration) {{ window.pywebview.api.narration_finished(); }}
+    else {{ window.pywebview.api.playback_finished(); }}
+  }};
   if (!b64) {{
-    window.pywebview.api.playback_finished();
+    notify();
     return;
   }}
-  const audio = new Audio("data:audio/mpeg;base64," + b64);
-  // Tells Python playback is truly done, not just that a reply was
-  // generated - this is what lets the wake-word listener stay paused
-  // for as long as Jarvis is actually speaking, so it can't hear (and
-  // react to) his own voice through the mic.
-  audio.onended = function() {{ window.pywebview.api.playback_finished(); }};
-  // Waiting for canplaythrough (fully decoded and ready) before calling
-  // play(), rather than playing immediately - starting playback before
-  // the browser has finished decoding the data URI was clipping the
-  // first word almost entirely.
-  audio.oncanplaythrough = function() {{ audio.play(); }};
+  if (!audioCtx) {{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }}
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {{
+    bytes[i] = binary.charCodeAt(i);
+  }}
+  audioCtx.decodeAudioData(bytes.buffer).then(function(audioBuffer) {{
+    const source = audioCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    const gainNode = audioCtx.createGain();
+    gainNode.gain.value = VOLUME_GAIN;
+    source.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    currentSource = source;
+    // Tells Python playback is truly done, not just that a reply was
+    // generated - this is what lets the wake-word listener stay paused
+    // for as long as Jarvis is actually speaking, so it can't hear (and
+    // react to) his own voice through the mic. Also fires if stopPlayback()
+    // force-stops this early (a barge-in) - .stop() triggers 'ended' too.
+    source.onended = function() {{ currentSource = null; notify(); }};
+    return audioCtx.resume().then(function() {{
+      source.start();
+    }});
+  }}).catch(function(err) {{
+    console.error("Playback failed:", err);
+    notify();
+  }});
 }}
 
 const msgInput = document.getElementById('msg-input');
@@ -698,11 +978,11 @@ const micBtn = document.getElementById('mic-btn');
 micBtn.addEventListener('click', function() {{
   if (!isRecording) {{
     isRecording = true;
-    micBtn.classList.add('recording');
+    setListening(true);
     window.pywebview.api.start_recording();
   }} else {{
     isRecording = false;
-    micBtn.classList.remove('recording');
+    setListening(false);
     msgInput.disabled = true;
     window.pywebview.api.stop_recording().then(function(result) {{
       if (result.transcript) {{
@@ -758,43 +1038,58 @@ document.getElementById('panel-header').addEventListener('mousedown', trackDragS
 """
 
 chat_open = False
-last_expanded_pos = None  # remembers where the chat panel was last dragged to
+
+# The ONE shared position the idle icon and the expanded chat panel are
+# both anchored to - specifically, their shared BOTTOM-RIGHT corner
+# (the corner that stays fixed while the panel grows "up and to the
+# left" from the icon - see get_position()). Used to be two separate
+# remembered spots (one for the icon, one for the panel), which meant
+# moving one didn't affect the other, so opening/closing could jump
+# between two unrelated positions. Now there's exactly one anchor:
+# dragging either the icon OR the open panel updates the same point,
+# and both derive their own top-left corner from it.
+last_anchor = None
 
 
 def _open_chat_panel():
     # Shared by the manual click handler and the wake-word listener, so
     # both paths open the panel identically.
-    global chat_open
+    global chat_open, last_anchor
     if chat_open:
         return
     chat_open = True
 
-    width, height = EXPANDED_WIDTH, EXPANDED_HEIGHT
-    if last_expanded_pos is not None:
-        # Reopen exactly where it was last dragged to.
-        x, y = last_expanded_pos
-    else:
-        # First time opening - its own independent corner spot,
-        # controlled by CHAT_MARGIN_RIGHT/CHAT_MARGIN_BOTTOM.
-        work_area = Screen.PrimaryScreen.WorkingArea
-        x = work_area.Right - width - CHAT_MARGIN_RIGHT
-        y = work_area.Bottom - height - CHAT_MARGIN_BOTTOM
+    if last_anchor is None:
+        # Never moved yet - anchor off wherever the icon actually is
+        # right now, so even the very first open lines up with it
+        # instead of jumping to a separately hardcoded default spot.
+        rect = get_current_rect()
+        last_anchor = (rect.left + IDLE_WIDTH, rect.top + IDLE_HEIGHT)
 
-    set_bounds(x, y, width, height)
+    anchor_x, anchor_y = last_anchor
+    x, y = anchor_x - EXPANDED_WIDTH, anchor_y - EXPANDED_HEIGHT
+    set_bounds(x, y, EXPANDED_WIDTH, EXPANDED_HEIGHT)
+    # Topmost only while actually open, so it can't get buried behind
+    # whatever you just clicked into mid-conversation - see _set_topmost.
+    _set_topmost(True)
     window.evaluate_js("setChatOpen(true)")
 
 
 def _close_chat_panel():
-    # Closing ALWAYS returns to the fixed corner - the icon never
-    # drifts, regardless of where the panel was dragged.
+    # Returns the icon to the same shared anchor the panel was just
+    # occupying, so it reappears exactly where the panel's corner was.
     global chat_open
     if not chat_open:
         return
     chat_open = False
 
-    width, height = IDLE_WIDTH, IDLE_HEIGHT
-    x, y = get_position(IDLE_WIDTH, IDLE_HEIGHT)
-    set_bounds(x, y, width, height)
+    anchor_x, anchor_y = last_anchor
+    x, y = anchor_x - IDLE_WIDTH, anchor_y - IDLE_HEIGHT
+    set_bounds(x, y, IDLE_WIDTH, IDLE_HEIGHT)
+    # Drop back to normal z-order now that nothing's actively open -
+    # this is the piece that stops the idle icon from sitting on top of
+    # whatever else you're working in.
+    _set_topmost(False)
     window.evaluate_js("setChatOpen(false)")
 
 
@@ -806,33 +1101,49 @@ class Api:
             _open_chat_panel()
 
     def save_position(self):
-        # Only meaningful while the chat panel is open, since the icon
-        # itself can no longer be dragged at all.
-        global last_expanded_pos
-        if chat_open:
-            rect = get_current_rect()
-            last_expanded_pos = (rect.left, rect.top)
+        # Works in both states - dragging the idle icon OR the open
+        # chat panel both update the same shared anchor point.
+        global last_anchor
+        rect = get_current_rect()
+        width, height = (EXPANDED_WIDTH, EXPANDED_HEIGHT) if chat_open else (IDLE_WIDTH, IDLE_HEIGHT)
+        last_anchor = (rect.left + width, rect.top + height)
 
     def send_message(self, message):
         # Same assistant.ask() the CLI (main.py) uses - same memory
         # database too, since both point at the same memory.py file.
-        text = assistant.ask(message)
+        text = assistant.ask(message, on_narrate=_narrate)
         audio_b64 = tts.speak(text)
         return {"text": text, "audio": audio_b64}
 
     def playback_finished(self):
         # Called from JS the moment a spoken reply's audio actually
-        # finishes playing (see playAudioBase64's audio.onended). Reads
+        # finishes playing (see playAudioBase64's audio.onended) - this
+        # also fires when a barge-in force-stops playback early (see
+        # _barge_in/stopPlayback), not just on a natural end. Reads
         # wake_after_playback - set in _speak_reply - to decide whether
         # this was an ordinary reply (open the follow_up window) or a
         # conversation-ending one (go straight to idle).
         global wake_after_playback
         next_step = wake_after_playback
         wake_after_playback = "follow_up"
+        with wake_lock:
+            current_state = wake_state
+        if current_state != "speaking":
+            # A barge-in already moved things on to "capturing" (or
+            # something else beat this to it) - don't clobber that by
+            # jumping to follow_up/idle now.
+            return
         if next_step == "idle":
             _enter_idle()
         else:
             _enter_follow_up()
+
+    def narration_finished(self):
+        # Called from JS the moment a narration line (see _narrate)
+        # finishes playing - separate from playback_finished() above so
+        # a mid-task narration never triggers the actual reply-finished
+        # transitions (follow_up/idle).
+        narration_done.set()
 
     def start_recording(self):
         # Pause the always-on wake-word listener first - both would
@@ -884,7 +1195,7 @@ class Api:
         if not transcript:
             return {"transcript": "", "text": "Didn't catch that, sir.", "audio": ""}
 
-        reply = assistant.ask(transcript)
+        reply = assistant.ask(transcript, on_narrate=_narrate)
         audio_b64 = tts.speak(reply)
         return {"transcript": transcript, "text": reply, "audio": audio_b64}
 
@@ -896,7 +1207,11 @@ window = webview.create_window(
     height=IDLE_HEIGHT,
     frameless=True,
     easy_drag=False,
-    on_top=True,
+    # Starts NOT topmost - idle is the default, most-of-the-time state,
+    # and forcing it above every other window was exactly what made it
+    # bother Jude while working elsewhere. _open_chat_panel() switches
+    # this on for as long as the chat panel is actually open.
+    on_top=False,
     resizable=False,
     js_api=Api(),
 )
