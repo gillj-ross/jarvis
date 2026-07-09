@@ -1,3 +1,8 @@
 anthropic>=0.40.0
 python-dotenv>=1.0.0
 pywebview>=5.0
+elevenlabs>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+openwakeword>=0.6.0
+onnxruntime>=1.16.0
