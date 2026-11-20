@@ -2,8 +2,8 @@
 
 A personal desktop assistant built on the Claude API. It remembers things between sessions, can read and change files and run shell commands (asking for confirmation before anything risky), talks back with natural-sounding voice, and lives as a small always-on-top widget in the corner of the screen.
 
-<!-- TODO: add a screenshot or GIF of the widget here -->
-<!-- ![Jarvis widget](docs/images/widget.png) -->
+<p align="center"><img src="docs/images/widget.png" alt="Jarvis desktop widget in its idle state" width="300"></p>
+<p align="center"><em>The desktop widget, idle. Click it to open the chat panel.</em></p>
 
 ## Features
 
